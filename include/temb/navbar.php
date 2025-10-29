@@ -9,9 +9,9 @@
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto">
-                    <li class="nav-item"><a class="nav-link" href="#home">Home</a></li>
+                    <li class="nav-item"><a class="nav-link" href="Convert_images.php">Convert</a></li>
                     <li class="nav-item"><a class="nav-link" href="QR_cood.php">QR COOd</a></li>
-                    <li class="nav-item"><a class="nav-link" href="#contact">Contact</a></li>
+                    <li class="nav-item"><a class="nav-link" href="Compress_images.php">Compress</a></li>
                 </ul>
             </div>
         </div>
