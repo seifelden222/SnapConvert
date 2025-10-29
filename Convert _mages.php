@@ -13,8 +13,37 @@ $maxBytes      = 8 * 1024 * 1024; // 8MB
 
 $err = [];
 $ok  = null;
-$dataUri = null;      // هنا هنخزن الـ data URI النهائي
-$downloadName = null; // اسم الملف المقترح للتحميل
+$dataUri = null;      // Store the final data URI here
+$downloadName = null; // Suggested filename for download
+
+/* -------------------- Helper Functions -------------------- */
+
+/**
+ * Convert SVG to raster format using rsvg-convert (fallback method)
+ * @param string $svgPath Path to SVG file
+ * @param string $format Output format (png, jpeg, webp)
+ * @param int $width Target width in pixels
+ * @return array [bytes, mimeType]
+ * @throws RuntimeException
+ */
+function svg_to_raster_via_rsvg(string $svgPath, string $format = 'png', int $width = 800): array {
+    if (!function_exists('shell_exec')) {
+        throw new RuntimeException('shell_exec is disabled; rsvg-convert cannot run.');
+    }
+    
+    $fmt = in_array($format, ['png', 'jpeg', 'jpg', 'webp']) ? $format : 'png';
+    $cmd = 'rsvg-convert -w ' . escapeshellarg((string)$width)
+         . ' -f ' . escapeshellarg($fmt)
+         . ' ' . escapeshellarg($svgPath) . ' 2>&1';
+    
+    $bytes = shell_exec($cmd);
+    if (!$bytes) {
+        throw new RuntimeException('rsvg-convert failed or returned empty output.');
+    }
+    
+    $mime = ($fmt === 'jpg' || $fmt === 'jpeg') ? 'image/jpeg' : 'image/' . $fmt;
+    return [$bytes, $mime];
+}
 
 /* -------------------- Handle POST -------------------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -45,7 +74,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $err['mime'] = "Invalid MIME type: $mime";
             }
 
-            if ($mime !== 'image/svg+xml' && getimagesize($image['tmp_name']) === false) {
+            // Check if it's a real image (only for basic raster formats)
+            // Note: getimagesize may not support WEBP/AVIF on older PHP versions
+            $rasterCheckMimes = ['image/jpeg', 'image/png', 'image/gif'];
+            if (in_array($mime, $rasterCheckMimes, true) && @getimagesize($image['tmp_name']) === false) {
                 $err['real'] = "The uploaded file is not a real image.";
             }
 
@@ -75,7 +107,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ($mime === 'image/svg+xml') {
                         // --- SVG input ---
                         if ($outFormat === 'svg') {
-                            // SVG -> SVG (بدون تحويل): اعرض المحتوى كما هو
+                            // SVG -> SVG (no conversion): display content as is
                             $bytes = file_get_contents($image['tmp_name']);
                             if ($bytes === false) {
                                 throw new RuntimeException('Failed to read SVG data.');
@@ -83,36 +115,84 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $dataUri = $toDataUri($bytes, 'image/svg+xml');
                             $ok = "SVG uploaded successfully (no conversion).";
                         } else {
-                            // SVG -> Raster (عايز imagick عادة)
-                            if (!extension_loaded('imagick')) {
-                                throw new RuntimeException("Imagick extension required to convert SVG to raster formats.");
-                            }
-
-                            $img = $manager->read($image['tmp_name']); // هيقرأ الـ SVG ويرسّمه
-
-                            // Encode in-memory حسب الصيغة
-                            $mimeType = 'image/' . $outFormat;
-                            if ($outFormat === 'jpeg') {
-                                $mimeType = 'image/jpeg';
-                            }
+                            // SVG -> Raster conversion
                             
-                            switch ($outFormat) {
-                                case 'jpeg':
-                                    $encoded = $img->toJpeg(95); break;
-                                case 'png':
-                                    $encoded = $img->toPng(); break;
-                                case 'webp':
-                                    $encoded = method_exists($img, 'toWebp') ? $img->toWebp(95) : $img->encodeByExtension('webp', 95); break;
-                                case 'avif':
-                                    $encoded = method_exists($img, 'toAvif') ? $img->toAvif(95) : $img->encodeByExtension('avif', 95); break;
-                                case 'gif':
-                                    $encoded = $img->toGif(); break;
-                                default:
-                                    throw new RuntimeException('Unsupported output.');
+                            // Try Imagick first (best quality)
+                            if (extension_loaded('imagick')) {
+                                try {
+                                    // Check if Imagick supports SVG
+                                    $formats = Imagick::queryFormats('SVG');
+                                    if (empty($formats)) {
+                                        throw new RuntimeException('Imagick does not support SVG (librsvg missing)');
+                                    }
+                                    
+                                    // Use Imagick directly for better control
+                                    $imagick = new Imagick();
+                                    
+                                    // Set resolution BEFORE reading for better quality
+                                    $imagick->setResolution(300, 300);
+                                    
+                                    // Read the SVG file
+                                    $svgContent = file_get_contents($image['tmp_name']);
+                                    $imagick->readImageBlob($svgContent);
+                                    
+                                    // Flatten layers for JPEG (removes transparency)
+                                    if ($outFormat === 'jpeg') {
+                                        $imagick->setImageBackgroundColor('white');
+                                        $imagick->setImageAlphaChannel(Imagick::ALPHACHANNEL_REMOVE);
+                                        $imagick = $imagick->mergeImageLayers(Imagick::LAYERMETHOD_FLATTEN);
+                                    }
+                                    
+                                    // Get dimensions
+                                    $width = $imagick->getImageWidth();
+                                    $height = $imagick->getImageHeight();
+                                    
+                                    // Scale to reasonable size if too large
+                                    $maxSize = 1600;
+                                    if ($width > $maxSize || $height > $maxSize) {
+                                        if ($width > $height) {
+                                            $newWidth = $maxSize;
+                                            $newHeight = (int)(($maxSize / $width) * $height);
+                                        } else {
+                                            $newHeight = $maxSize;
+                                            $newWidth = (int)(($maxSize / $height) * $width);
+                                        }
+                                        $imagick->resizeImage($newWidth, $newHeight, Imagick::FILTER_LANCZOS, 1);
+                                    }
+                                    
+                                    // Set output format
+                                    $imagick->setImageFormat($outFormat === 'jpeg' ? 'jpg' : $outFormat);
+                                    
+                                    // Set compression quality for lossy formats
+                                    if (in_array($outFormat, ['jpeg', 'webp', 'avif'], true)) {
+                                        $imagick->setImageCompressionQuality(95);
+                                    }
+                                    
+                                    // Get the binary data
+                                    $encoded = $imagick->getImageBlob();
+                                    
+                                    // Clean up
+                                    $imagick->clear();
+                                    $imagick->destroy();
+                                    
+                                    $mimeType = $outFormat === 'jpeg' ? 'image/jpeg' : 'image/' . $outFormat;
+                                    $dataUri = $toDataUri($encoded, $mimeType);
+                                    $ok = "SVG converted successfully to " . strtoupper($outFormat) . " (via Imagick).";
+                                    
+                                } catch (\Exception $e) {
+                                    // Imagick failed, try fallback
+                                    throw new RuntimeException("Imagick SVG conversion failed: " . $e->getMessage());
+                                }
+                            } else {
+                                // Fallback: Try rsvg-convert
+                                try {
+                                    [$encoded, $mimeType] = svg_to_raster_via_rsvg($image['tmp_name'], $outFormat, 1600);
+                                    $dataUri = $toDataUri($encoded, $mimeType);
+                                    $ok = "SVG converted successfully to " . strtoupper($outFormat) . " (via rsvg-convert).";
+                                } catch (RuntimeException $e) {
+                                    throw new RuntimeException("SVG conversion failed. Install Imagick with librsvg support or rsvg-convert: " . $e->getMessage());
+                                }
                             }
-
-                            $dataUri = $toDataUri($encoded->toString(), $mimeType);
-                            $ok = "SVG converted successfully to " . strtoupper($outFormat) . ".";
                         }
 
                     } else {
@@ -224,12 +304,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <div class="format-section">
                                 <h5 class="text-center mb-3 fw-bold">اختر صيغة التحويل</h5>
                                 <div class="row g-2 mb-3">
-                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn active" onclick="selectFormat('webp')">WEBP</button></div>
-                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('avif')">AVIF</button></div>
-                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('jpeg')">JPEG</button></div>
-                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('png')">PNG</button></div>
-                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('gif')">GIF</button></div>
-                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('svg')">SVG</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn active" onclick="selectFormat(this, 'webp')">WEBP</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat(this, 'avif')">AVIF</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat(this, 'jpeg')">JPEG</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat(this, 'png')">PNG</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat(this, 'gif')">GIF</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat(this, 'svg')">SVG</button></div>
                                 </div>
                                 <input type="hidden" name="format" id="selectedFormat" value="webp">
                                 <button type="submit" class="btn btn-success w-100 btn-lg">
@@ -290,9 +370,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <?php include("include/temb/footer.php"); ?>
 
 <script>
-function selectFormat(fmt){
-  document.getElementById('selectedFormat').value = fmt;
-  document.querySelectorAll('.format-btn').forEach(b=>b.classList.remove('active'));
-  event.target.classList.add('active');
+/**
+ * Select output format and update UI
+ * @param {HTMLElement} element - The clicked button element
+ * @param {string} format - The selected format (webp, avif, jpeg, png, gif, svg)
+ */
+function selectFormat(element, format) {
+    // Update hidden input value
+    document.getElementById('selectedFormat').value = format;
+    
+    // Remove active class from all buttons
+    document.querySelectorAll('.format-btn').forEach(button => {
+        button.classList.remove('active');
+    });
+    
+    // Add active class to clicked button
+    element.classList.add('active');
 }
 </script>
