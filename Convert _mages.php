@@ -10,49 +10,33 @@ include("include/temb/header.php");
 $allowed_exts  = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg'];
 $allowed_mimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif', 'image/svg+xml'];
 $maxBytes      = 8 * 1024 * 1024; // 8MB
-$uploadDir     = __DIR__ . '/uploads/';
-
-// Clean old files (older than 30 minutes)
-if (is_dir($uploadDir)) {
-    $files = glob($uploadDir . '*');
-    $now = time();
-    foreach ($files as $file) {
-        if (is_file($file) && ($now - filemtime($file)) > 1800) { // 30 minutes
-            unlink($file);
-        }
-    }
-}
 
 $err = [];
 $ok  = null;
-$convertedImage = null;
+$dataUri = null;      // هنا هنخزن الـ data URI النهائي
+$downloadName = null; // اسم الملف المقترح للتحميل
 
 /* -------------------- Handle POST -------------------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
-    // Ensure file exists
     if (!isset($_FILES['image']) || !is_array($_FILES['image'])) {
         $err['image'] = "Please upload an image.";
     } else {
         $image = $_FILES['image'];
 
-        // Basic upload checks
         if ($image['error'] !== UPLOAD_ERR_OK) {
             $err['image'] = "Upload error code: " . $image['error'];
         } else {
 
-            // Size check
             if ($image['size'] > $maxBytes) {
                 $err['size'] = "Max file size is " . (int)round($maxBytes / 1024 / 1024) . "MB.";
             }
 
-            // Extension (from name)
             $ext = strtolower(pathinfo($image['name'], PATHINFO_EXTENSION));
             if (!in_array($ext, $allowed_exts, true)) {
                 $err['ext'] = "Allowed extensions: " . implode(', ', $allowed_exts);
             }
 
-            // MIME (real type from content)
             $finfo = finfo_open(FILEINFO_MIME_TYPE);
             $mime  = finfo_file($finfo, $image['tmp_name']);
             finfo_close($finfo);
@@ -61,7 +45,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $err['mime'] = "Invalid MIME type: $mime";
             }
 
-            // Raster sanity (skip for SVG which is text-based)
             if ($mime !== 'image/svg+xml' && getimagesize($image['tmp_name']) === false) {
                 $err['real'] = "The uploaded file is not a real image.";
             }
@@ -76,126 +59,142 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (empty($err)) {
                 $ok = "Checks passed. Ready to convert.";
 
-                // Prepare uploads dir
-                if (!is_dir($uploadDir)) {
-                    mkdir($uploadDir, 0755, true);
-                }
-
-                // Sanitize base name + add random suffix
                 $baseName = preg_replace('/[^A-Za-z0-9_\-]+/', '_', pathinfo($image['name'], PATHINFO_FILENAME)) ?: 'image';
-                $uniq     = bin2hex(random_bytes(4));
+                $downloadName = $baseName . '.' . $outFormat;
 
-                // Choose driver (Intervention v3)
+                // اختار درايفر Intervention v3 (imagick لو متاح، غير كده gd)
                 $driver  = extension_loaded('imagick') ? 'imagick' : 'gd';
                 $manager = ($driver === 'imagick') ? ImageManager::imagick() : ImageManager::gd();
 
-                /* ------------ SVG input ------------ */
-                if ($mime === 'image/svg+xml') {
-                    if ($outFormat === 'svg') {
-                        // SVG -> SVG (no conversion)
-                        $fileName = "{$baseName}_{$uniq}.svg";
-                        $savePath = $uploadDir . $fileName;
+                // Helper لتحويل بولة بايتس إلى data URI
+                $toDataUri = function (string $bytes, string $mime) {
+                    return 'data:' . $mime . ';base64,' . base64_encode($bytes);
+                };
 
-                        // Use move_uploaded_file for uploaded files
-                        if (!move_uploaded_file($image['tmp_name'], $savePath)) {
-                            $err['move'] = "Failed to save the SVG file.";
-                        } else {
+                try {
+                    if ($mime === 'image/svg+xml') {
+                        // --- SVG input ---
+                        if ($outFormat === 'svg') {
+                            // SVG -> SVG (بدون تحويل): اعرض المحتوى كما هو
+                            $bytes = file_get_contents($image['tmp_name']);
+                            if ($bytes === false) {
+                                throw new RuntimeException('Failed to read SVG data.');
+                            }
+                            $dataUri = $toDataUri($bytes, 'image/svg+xml');
                             $ok = "SVG uploaded successfully (no conversion).";
-                            $convertedImage = 'uploads/' . $fileName;
-                        }
-                    } else {
-                        // SVG -> raster (requires Imagick to rasterize)
-                        if (!extension_loaded('imagick')) {
-                            $err['imagick'] = "Imagick extension required to convert SVG to raster formats.";
                         } else {
-                            try {
-                                $img = $manager->read($image['tmp_name']); // may fail if SVG support is missing
-                                $fileName = "{$baseName}_{$uniq}.{$outFormat}";
-                                $savePath = $uploadDir . $fileName;
-
-                                // Save with quality for supported formats
-                                $quality = in_array($outFormat, ['jpeg', 'webp', 'avif'], true) ? 95 : null;
-                                if ($quality !== null) {
-                                    $img->save($savePath, $quality);
-                                } else {
-                                    $img->save($savePath);
-                                }
-
-                                $ok = "SVG converted successfully to " . strtoupper($outFormat) . ".";
-                                $convertedImage = 'uploads/' . $fileName;
-                            } catch (Exception $e) {
-                                $err['process'] = "SVG conversion failed: " . $e->getMessage();
+                            // SVG -> Raster (عايز imagick عادة)
+                            if (!extension_loaded('imagick')) {
+                                throw new RuntimeException("Imagick extension required to convert SVG to raster formats.");
                             }
-                        }
-                    }
 
-                    /* -------- Raster input (JPEG/PNG/GIF/WebP/AVIF...) -------- */
-                } else {
+                            $img = $manager->read($image['tmp_name']); // هيقرأ الـ SVG ويرسّمه
 
-                    // Raster -> SVG (vectorization) via potrace (optional feature)
-                    if ($outFormat === 'svg') {
-                        $fileName = "{$baseName}_{$uniq}.svg";
-                        $savePath = $uploadDir . $fileName;
-
-                        // Check potrace availability
-                        $whichPotrace = shell_exec('command -v potrace 2>&1');
-                        if (empty($whichPotrace)) {
-                            $err['potrace'] = "Potrace is not installed. Install it to convert raster images to SVG.";
-                        } else {
-                            // Convert to temporary BMP (potrace expects BMP)
-                            try {
-                                $img = $manager->read($image['tmp_name']);
-
-                                $tmpBmp = $uploadDir . "tmp_{$uniq}.bmp";
-                                $img->save($tmpBmp);
-
-                                // Run potrace safely
-                                $cmd = "potrace " . escapeshellarg($tmpBmp) . " -s -o " . escapeshellarg($savePath) . " 2>&1";
-                                $output = shell_exec($cmd);
-
-                                // Cleanup temp
-                                if (file_exists($tmpBmp)) {
-                                    unlink($tmpBmp);
-                                }
-
-                                // Validate result
-                                if (file_exists($savePath) && filesize($savePath) > 0) {
-                                    $ok = "Image converted successfully to SVG (vectorized).";
-                                    $convertedImage = 'uploads/' . $fileName;
-                                } else {
-                                    $err['conversion'] = "SVG conversion failed. Output: " . (string)$output;
-                                }
-                            } catch (Exception $e) {
-                                $err['process'] = "Process failed: " . $e->getMessage();
+                            // Encode in-memory حسب الصيغة
+                            $mimeType = 'image/' . $outFormat;
+                            if ($outFormat === 'jpeg') {
+                                $mimeType = 'image/jpeg';
                             }
+                            
+                            switch ($outFormat) {
+                                case 'jpeg':
+                                    $encoded = $img->toJpeg(95); break;
+                                case 'png':
+                                    $encoded = $img->toPng(); break;
+                                case 'webp':
+                                    $encoded = method_exists($img, 'toWebp') ? $img->toWebp(95) : $img->encodeByExtension('webp', 95); break;
+                                case 'avif':
+                                    $encoded = method_exists($img, 'toAvif') ? $img->toAvif(95) : $img->encodeByExtension('avif', 95); break;
+                                case 'gif':
+                                    $encoded = $img->toGif(); break;
+                                default:
+                                    throw new RuntimeException('Unsupported output.');
+                            }
+
+                            $dataUri = $toDataUri($encoded->toString(), $mimeType);
+                            $ok = "SVG converted successfully to " . strtoupper($outFormat) . ".";
                         }
+
                     } else {
-                        // Raster -> Raster conversion
-                        try {
+                        // --- Raster input (JPEG/PNG/GIF/WebP/AVIF...) ---
+
+                        if ($outFormat === 'svg') {
+                            // Raster -> SVG (vectorization) عبر potrace (محتاج ملفات مؤقتة في الـ temp وهنمسحها فورًا)
+                            $whichPotrace = shell_exec('command -v potrace 2>&1');
+                            if (empty($whichPotrace)) {
+                                throw new RuntimeException("Potrace is not installed. Install it to convert raster images to SVG.");
+                            }
+
                             $img = $manager->read($image['tmp_name']);
 
-                            // Optional: downscale large images
+                            // نحول مؤقتًا لـ BMP لأن potrace بيقبل BMP
+                            $tmpDir = sys_get_temp_dir();
+                            $uniq   = bin2hex(random_bytes(4));
+                            $tmpBmp = $tmpDir . "/tmp_{$uniq}.bmp";
+                            $tmpSvg = $tmpDir . "/tmp_{$uniq}.svg";
+
+                            // حفظ BMP مؤقت (هيتخزن ثواني ويتشال)
+                            $img->save($tmpBmp);
+
+                            // Run potrace
+                            $cmd = "potrace " . escapeshellarg($tmpBmp) . " -s -o " . escapeshellarg($tmpSvg) . " 2>&1";
+                            $output = shell_exec($cmd);
+
+                            // اقرأ الناتج وخليه data URI
+                            if (!file_exists($tmpSvg) || filesize($tmpSvg) === 0) {
+                                // نظّف قبل ما ترمي خطأ
+                                if (file_exists($tmpBmp)) unlink($tmpBmp);
+                                if (file_exists($tmpSvg)) unlink($tmpSvg);
+                                throw new RuntimeException("SVG conversion failed. Output: " . (string)$output);
+                            }
+
+                            $bytes = file_get_contents($tmpSvg);
+                            $dataUri = $toDataUri($bytes, 'image/svg+xml');
+
+                            // Cleanup
+                            if (file_exists($tmpBmp)) unlink($tmpBmp);
+                            if (file_exists($tmpSvg)) unlink($tmpSvg);
+
+                            $ok = "Image converted successfully to SVG (vectorized).";
+
+                        } else {
+                            // Raster -> Raster (كلو في الذاكرة)
+                            $img = $manager->read($image['tmp_name']);
+
+                            // (اختياري) تصغير الصور الكبيرة
                             // if ($img->width() > 1600) {
                             //     $img->resize(1600, null, function($c){ $c->aspectRatio(); $c->upsize(); });
                             // }
 
-                            $fileName = "{$baseName}_{$uniq}.{$outFormat}";
-                            $savePath = $uploadDir . $fileName;
-
-                            // Save with quality for supported formats
-                            $quality = in_array($outFormat, ['jpeg', 'webp', 'avif'], true) ? 95 : null;
-                            if ($quality !== null) {
-                                $img->save($savePath, $quality);
-                            } else {
-                                $img->save($savePath);
+                            $mimeType = 'image/' . $outFormat;
+                            if ($outFormat === 'jpeg') {
+                                $mimeType = 'image/jpeg';
+                            }
+                            
+                            switch ($outFormat) {
+                                case 'jpeg':
+                                    $encoded = $img->toJpeg(95); break;
+                                case 'png':
+                                    $encoded = $img->toPng(); break;
+                                case 'webp':
+                                    $encoded = method_exists($img, 'toWebp') ? $img->toWebp(95) : $img->encodeByExtension('webp', 95); break;
+                                case 'avif':
+                                    $encoded = method_exists($img, 'toAvif') ? $img->toAvif(95) : $img->encodeByExtension('avif', 95); break;
+                                case 'gif':
+                                    $encoded = $img->toGif(); break;
+                                default:
+                                    throw new RuntimeException('Unsupported output.');
                             }
 
+                            $dataUri = $toDataUri($encoded->toString(), $mimeType);
                             $ok = "Image converted successfully to " . strtoupper($outFormat) . ".";
-                            $convertedImage = 'uploads/' . $fileName;
-                        } catch (Exception $e) {
-                            $err['save'] = "Failed to save converted image: " . $e->getMessage();
                         }
                     }
+
+                } catch (Throwable $e) {
+                    $err['process'] = "Processing failed: " . $e->getMessage();
+                    $dataUri = null;
+                    $downloadName = null;
                 }
             }
         }
@@ -203,11 +202,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 ?>
 
-
-
 <div class="container-fluid">
-    <!-- Header -->
-<?php include("include/temb/navbar.php"); ?>
+    <?php include("include/temb/navbar.php"); ?>
 
     <form action="" method="post" enctype="multipart/form-data">
         <div class="container my-5">
@@ -228,24 +224,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <div class="format-section">
                                 <h5 class="text-center mb-3 fw-bold">اختر صيغة التحويل</h5>
                                 <div class="row g-2 mb-3">
-                                    <div class="col-4">
-                                        <button type="button" class="btn btn-outline-info w-100 format-btn active" onclick="selectFormat('webp')">WEBP</button>
-                                    </div>
-                                    <div class="col-4">
-                                        <button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('avif')">AVIF</button>
-                                    </div>
-                                    <div class="col-4">
-                                        <button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('jpeg')">JPEG</button>
-                                    </div>
-                                    <div class="col-4">
-                                        <button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('png')">PNG</button>
-                                    </div>
-                                    <div class="col-4">
-                                        <button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('gif')">GIF</button>
-                                    </div>
-                                    <div class="col-4">
-                                        <button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('svg')">SVG</button>
-                                    </div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn active" onclick="selectFormat('webp')">WEBP</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('avif')">AVIF</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('jpeg')">JPEG</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('png')">PNG</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('gif')">GIF</button></div>
+                                    <div class="col-4"><button type="button" class="btn btn-outline-info w-100 format-btn" onclick="selectFormat('svg')">SVG</button></div>
                                 </div>
                                 <input type="hidden" name="format" id="selectedFormat" value="webp">
                                 <button type="submit" class="btn btn-success w-100 btn-lg">
@@ -260,6 +244,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     echo '<li>' . htmlspecialchars($e, ENT_QUOTES, 'UTF-8') . '</li>';
                                 }
                                 echo '</ul></div>';
+                            } elseif (!empty($ok)) {
+                                echo '<div class="alert alert-success mt-3">'.htmlspecialchars($ok, ENT_QUOTES, 'UTF-8').'</div>';
                             }
                             ?>
                         </div>
@@ -272,8 +258,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <div class="card-body p-4">
                             <h5 class="card-title fw-bold mb-3">Preview/Download</h5>
                             <div class="preview-area bg-light rounded p-4 text-center">
-                                <?php if (!empty($ok) && $convertedImage): ?>
-                                    <img src="<?php echo htmlspecialchars($convertedImage, ENT_QUOTES, 'UTF-8'); ?>" 
+                                <?php if ($dataUri): ?>
+                                    <img src="<?php echo htmlspecialchars($dataUri, ENT_QUOTES, 'UTF-8'); ?>"
                                          alt="Converted Image" class="img-fluid rounded shadow">
                                 <?php else: ?>
                                     <div class="preview-placeholder">
@@ -283,24 +269,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <?php endif; ?>
                             </div>
 
-                            <?php if (!empty($ok) && $convertedImage): ?>
+                            <?php if ($dataUri && $downloadName): ?>
                                 <div class="mt-3">
-                                    <?php
-                                    $filename = basename($convertedImage);
-                                    echo '<a href="download.php?file=' . urlencode($filename) . '" class="btn btn-primary w-100 btn-lg">
-                                            <i class="bi bi-download me-2"></i>Download Image
-                                          </a>';
-                                    ?>
+                                    <a href="<?php echo htmlspecialchars($dataUri, ENT_QUOTES, 'UTF-8'); ?>"
+                                       download="<?php echo htmlspecialchars($downloadName, ENT_QUOTES, 'UTF-8'); ?>"
+                                       class="btn btn-primary w-100 btn-lg">
+                                        <i class="bi bi-download me-2"></i>Download Image
+                                    </a>
                                 </div>
                             <?php endif; ?>
                         </div>
                     </div>
                 </div>
+
             </div>
         </div>
     </form>
-
-    <!-- Footer -->
 </div>
 
 <?php include("include/temb/footer.php"); ?>
+
+<script>
+function selectFormat(fmt){
+  document.getElementById('selectedFormat').value = fmt;
+  document.querySelectorAll('.format-btn').forEach(b=>b.classList.remove('active'));
+  event.target.classList.add('active');
+}
+</script>
